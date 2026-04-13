@@ -1,0 +1,24 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# SQLite Database files
+ovan.sqlite
+ovan.sqlite-shm
+ovan.sqlite-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Project-specific
+compiled_codebase.txt
