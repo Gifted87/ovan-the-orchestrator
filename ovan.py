@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Ovan: The ACN -> ProCoder Orchestrator
+Ovan: The Orchestrator 
 --------------------------------------
-Phase 1: Runs ACN Genesis. Streams output and intercepts the "Codebase: <path>" line.
-         (Can be skipped by passing --path <directory>)
-Phase 2: Runs ProCoder targeting the extracted (or provided) workspace directory.
-         - Waits for "System Mixer: Phase 2 (Binding) complete." to begin goals.
-         - Uses a 30 MINUTE (1800s) IDLE TIMEOUT: Timer resets every time a log is printed.
-         - Wipes context via /new, injects goals, auto-approves diffs, pauses 30s between.
+Phase 1: ACN Genesis generation.
+Phase 2: ProCoder Baseline Refinement (Bug fixing, Testing).
+Phase 3: Critic Agent Evaluation (3 iterations). Uses Gemini to critique compiled codebase.
+Phase 4: Final Production Review (Up to 3 iterations). Uses Gemini to review readiness.
 """
 
 import sys
@@ -23,11 +21,19 @@ except ImportError:
     print("Install it by running: pip install pexpect\n")
     sys.exit(1)
 
+try:
+    import google.generativeai as genai
+except ImportError:
+    print("\n[OVAN ERROR] 'google-generativeai' library is required for Phase 3 & 4.")
+    print("Install it by running: pip install google-generativeai\n")
+    sys.exit(1)
+
 # ANSI Colors
 C_CYAN = '\033[96m'
 C_GREEN = '\033[92m'
 C_YELLOW = '\033[93m'
 C_RED = '\033[91m'
+C_MAGENTA = '\033[95m'
 C_RESET = '\033[0m'
 
 ACN_HOME = os.environ.get("ACN_HOME", "/home/gifted/acn")
@@ -37,7 +43,7 @@ PROCODER_HOME = os.environ.get("PROCODER_HOME", "/home/gifted/procoder_system")
 IDLE_TIMEOUT_SECONDS = 1800 
 
 # ---------------------------------------------------------------------------
-# The Strict 3-Goal Refinement Pipeline (Word-for-Word from User)
+# Phase 2: The Strict 3-Goal Refinement Pipeline
 # ---------------------------------------------------------------------------
 REFINEMENT_GOALS = [
     """First of all, create an architecture breakdown.md document and for each step on the way, update your findings to this document.
@@ -73,7 +79,6 @@ Write a 3000 words Readme, and a 3000 words specifications document. Documenting
 YOU MUST GO TO THE BASE PATH OF THE PROJECT AND USE "ls" command to ensure you dont skip any important project directory!!! this is of utmost importance. you must never overlook this in struction. pay attention here!!!
 THIS INSTRICTION IS NON NEGOTIABLE AND MUST BE FOLLOWED STRICTLY
 
-
 When this entire process is completely finished, use the 'finish' tool."""
 ]
 
@@ -96,19 +101,15 @@ def run_phase1_acn(task):
     extracted_path = None
     
     try:
-        # Run ACN, pipe stdout so we can read line-by-line while also printing it to the user
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
-            
-            # Intercept the exact output path
             if "Codebase:" in line:
                 extracted_path = line.split("Codebase:")[1].strip()
 
         process.wait()
-        
         if process.returncode != 0:
             log("ACN Genesis failed or was interrupted. Aborting.", C_RED)
             sys.exit(process.returncode)
@@ -140,8 +141,122 @@ def countdown_timer(seconds, msg_prefix="Next goal starting in"):
         print("\n")
         log("Timer interrupted. Skipping remaining wait time.", C_YELLOW)
 
-def run_phase2_procoder(target_dir, procoder_cmd, idle_timeout=1800, pause_seconds=30):
-    """Phase 2: Interactive ProCoder Refinement via PTY with IDLE restart handling."""
+# ---------------------------------------------------------------------------
+# Consolidation & Agent Implementations (Phases 3 & 4)
+# ---------------------------------------------------------------------------
+def consolidate_codebase(target_dir):
+    """Crawls directory and concatenates code into a single string for Gemini."""
+    ignored_dirs = {
+        "_build", "deps", "tmp", "test", "dist", "tests", "reports", 
+        "samples", "__pycache__", "node_modules", ".git", ".idea", 
+        ".vscode", "venv311", "env", "venv"
+    }
+    ignored_filenames = {
+        "compiled_codebase.txt", "consolidator.py", "package-lock.json", "yarn.lock", "ovan_agent_instruction.txt"
+    }
+    
+    output = []
+    for root, dirs, files in os.walk(target_dir):
+        # Modify dirs in-place to skip ignored directories
+        dirs[:] = [d for d in dirs if d not in ignored_dirs]
+        
+        for file in files:
+            if file in ignored_filenames:
+                continue
+                
+            filepath = os.path.join(root, file)
+            rel_path = os.path.relpath(filepath, target_dir)
+            
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                output.append(f"--- File: {rel_path} ---\n{content}\n")
+            except UnicodeDecodeError:
+                pass # Skip binary files seamlessly
+                
+    return "\n".join(output)
+
+def call_gemini_agent(prompt, retries=3):
+    """Executes a call to Gemini Pro for codebase critique and review."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        log("ERROR: GEMINI_API_KEY environment variable is missing.", C_RED)
+        log("Please export GEMINI_API_KEY='your_api_key' to run Phases 3 & 4.", C_YELLOW)
+        sys.exit(1)
+        
+    genai.configure(api_key=api_key)
+    # Using Gemini 3 Flash preview to comfortably handle giant codebase context windows
+    model = genai.GenerativeModel("gemini-3-flash-preview")
+    
+    for attempt in range(retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            log(f"Gemini API error: {e}", C_YELLOW)
+            if attempt < retries - 1:
+                log("Retrying Gemini API in 10 seconds...", C_YELLOW)
+                time.sleep(10)
+            else:
+                log("Failed to get response from Gemini API after multiple retries.", C_RED)
+                raise
+
+# ---------------------------------------------------------------------------
+# Core ProCoder Orchestration Loop
+# ---------------------------------------------------------------------------
+def execute_procoder_goal(child, goal_text, prefix, idle_timeout, pause_seconds):
+    """Executes a single ProCoder prompt sequence, tracks approvals, waits for finish."""
+    log(f"\n=============================================", C_CYAN)
+    log(f"Executing {prefix}", C_YELLOW)
+    log(f"=============================================\n", C_CYAN)
+    
+    flush_pexpect_buffer(child)
+    
+    log("Resetting session via /new...", C_CYAN)
+    child.sendline("/new")
+    try:
+        child.expect(r'New session started', timeout=30)
+    except pexpect.TIMEOUT:
+        log("Warning: Did not see 'New session started' confirmation. Injecting goal anyway...", C_YELLOW)
+
+    time.sleep(2) 
+    
+    log("Injecting prompt into ProCoder...", C_GREEN)
+    child.sendline(goal_text)
+
+    approvals_for_this_goal = 0
+    max_approvals = 500 
+    
+    while True:
+        idx = child.expect([
+            r'\[ProCoder\] Summary', 
+            r'Apply changes\?.*\(y\)es',
+            r'\r?\n' 
+        ], timeout=idle_timeout)
+
+        if idx == 0:
+            log(f"{prefix} completed successfully.", C_GREEN)
+            try: child.expect(r'> ', timeout=5)
+            except pexpect.TIMEOUT: pass
+            
+            log(f"Initiating {pause_seconds}-second resting cooldown...", C_YELLOW)
+            countdown_timer(pause_seconds, msg_prefix="Next phase starting in")
+            return True
+            
+        elif idx == 1:
+            if approvals_for_this_goal >= max_approvals:
+                log("WARNING: Maximum auto-approvals reached. Rejecting to break loop.", C_RED)
+                child.sendline("n")
+            else:
+                child.sendline("y")
+                approvals_for_this_goal += 1
+                
+        elif idx == 2:
+            pass # Active ProCoder logging, loops again and resets timeout
+
+
+def run_phases_2_to_4(target_dir, procoder_cmd, idle_timeout=1800, pause_seconds=30):
+    """Orchestrates Phases 2, 3, and 4 inside a resilient state machine."""
     log(f"Changing to ProCoder directory: {PROCODER_HOME}")
     if not os.path.exists(PROCODER_HOME):
         log(f"ERROR: ProCoder directory not found at {PROCODER_HOME}", C_RED)
@@ -149,14 +264,13 @@ def run_phase2_procoder(target_dir, procoder_cmd, idle_timeout=1800, pause_secon
         
     os.chdir(PROCODER_HOME)
 
-    log(f"Starting Phase 2: ProCoder Refinement", C_GREEN)
-    log(f"Targeting Codebase: {target_dir}")
-
-    current_goal_index = 0
+    # State Machine Variables
+    state_phase = 2
+    state_index = 0
     max_retries = 5
     retry_count = 0
 
-    while current_goal_index < len(REFINEMENT_GOALS):
+    while state_phase <= 4:
         cmd = f"{procoder_cmd} {target_dir}"
         log(f"Launching ProCoder: {cmd}")
         
@@ -165,187 +279,162 @@ def run_phase2_procoder(target_dir, procoder_cmd, idle_timeout=1800, pause_secon
         phase_marker = "STARTUP"
 
         try:
-            # ---------------------------------------------------------
-            # WAIT FOR CDMS/SYSTEM TO FULLY INITIALIZE
-            # ---------------------------------------------------------
+            # WAIT FOR INIT
             phase_marker = "INIT"
             log(f"Waiting for 'System Mixer' or 'GENESIS: Cold Boot' (Timeout: {idle_timeout}s)...", C_YELLOW)
-            
             while True:
                 idx = child.expect([
                     r'System\s*Mixer.*Phase\s*2.*Binding.*complete',
                     r'GENESIS:\s*Cold\s*Boot\s*COMPLETE',
-                    r'\r?\n' # Matches any log line, resetting the timeout
+                    r'\r?\n'
                 ], timeout=idle_timeout)
-                
                 if idx == 0 or idx == 1:
-                    log("System is fully bound/booted and ready! Proceeding with goals...", C_GREEN)
+                    log("System is fully bound/booted and ready! Proceeding with tasks...", C_GREEN)
                     break
-                elif idx == 2:
-                    # System is actively logging startup sequences. Timer resets!
-                    pass
 
-            # ---------------------------------------------------------
-            # EXECUTE REMAINING GOALS
-            # ---------------------------------------------------------
-            phase_marker = "GOAL"
-            while current_goal_index < len(REFINEMENT_GOALS):
-                goal = REFINEMENT_GOALS[current_goal_index]
+            # GOAL EXECUTION
+            phase_marker = "EXECUTION"
+            while state_phase <= 4:
+                goal_text = ""
+                instruction_path = os.path.join(target_dir, "ovan_agent_instruction.txt")
                 
-                log(f"\n=============================================", C_CYAN)
-                log(f"Executing Goal {current_goal_index+1}/{len(REFINEMENT_GOALS)}", C_YELLOW)
-                log(f"=============================================\n", C_CYAN)
-                
-                # 1. Flush terminal buffer to clear any leftover "> " prompts
-                flush_pexpect_buffer(child)
-                
-                # 2. Reset memory session for a clean slate
-                log("Resetting session via /new...", C_CYAN)
-                child.sendline("/new")
-                
-                # 3. Permissive, non-fatal check for the session reset
-                try:
-                    child.expect(r'New session started', timeout=30)
-                    log("Session reset confirmed.", C_GREEN)
-                except pexpect.TIMEOUT:
-                    log("Warning: Did not see 'New session started' confirmation. Injecting goal anyway...", C_YELLOW)
-
-                time.sleep(2) # Give ProCoder time to digest the command
-                
-                # 4. Inject the goal
-                # FIX: Sanitizing the goal to a single line to prevent the REPL 
-                # from being triggered by internal newlines in the goal text.
-                log("Injecting sanitized goal prompt...", C_GREEN)
-                sanitized_goal = " ".join([line.strip() for line in goal.splitlines() if line.strip()])
-                child.sendline(sanitized_goal)
-
-                approvals_for_this_goal = 0
-                max_approvals = 500 # Increased significantly to accommodate massive file-by-file testing
-                
-                # 5. Idle Timeout Loop: Waits for Summary or Diff approval.
-                while True:
-                    idx = child.expect([
-                        r'\[ProCoder\] Summary', 
-                        r'Apply changes\?.*\(y\)es',
-                        r'\r?\n' # Matches ANY log line, resetting the timeout
-                    ], timeout=idle_timeout)
-
-                    if idx == 0:
-                        # The finish tool was called!
-                        log(f"Goal {current_goal_index+1} completed successfully.", C_GREEN)
+                # --- PHASE 2: BASELINE REFINEMENT ---
+                if state_phase == 2:
+                    if state_index >= len(REFINEMENT_GOALS):
+                        state_phase = 3
+                        state_index = 0
+                        continue
                         
-                        # Absorb the final '> ' prompt that appears right after the summary
-                        try:
-                            child.expect(r'> ', timeout=5)
-                        except pexpect.TIMEOUT:
-                            pass
-                        
-                        current_goal_index += 1
-                        retry_count = 0 # reset retries on success
-                        break # Break out of the inner loop to move to the next goal
-                        
-                    elif idx == 1:
-                        # The agent proposed a diff, auto-approve it
-                        if approvals_for_this_goal >= max_approvals:
-                            log("WARNING: Maximum auto-approvals reached. Rejecting to break loop.", C_RED)
-                            child.sendline("n")
-                        else:
-                            log("Auto-approving proposed diff...", C_YELLOW)
-                            child.sendline("y")
-                            approvals_for_this_goal += 1
-                            
-                    elif idx == 2:
-                        # The agent is actively researching/coding and printed a log.
-                        # The while loop continues, and the 30-minute idle timer is RESET to 0.
-                        pass
+                    prefix = f"Phase 2: Base Refinement (Goal {state_index+1}/{len(REFINEMENT_GOALS)})"
+                    # Sanitize internal newlines so Pexpect's sendline executes as a single command
+                    goal_text = " ".join([line.strip() for line in REFINEMENT_GOALS[state_index].splitlines() if line.strip()])
 
-                # 6. Apply Timeout between goals
-                if current_goal_index < len(REFINEMENT_GOALS):
-                    log(f"Initiating {pause_seconds}-second resting cooldown...", C_YELLOW)
-                    countdown_timer(pause_seconds, msg_prefix="Next goal starting in")
+                # --- PHASE 3: CRITIC AGENT ---
+                elif state_phase == 3:
+                    if state_index >= 3:
+                        state_phase = 4
+                        state_index = 0
+                        continue
+                        
+                    prefix = f"Phase 3: Critic Agent (Attempt {state_index+1}/3)"
+                    log("\nCompiling codebase for Critic Agent...", C_MAGENTA)
+                    codebase = consolidate_codebase(target_dir)
+                    
+                    log("Calling Gemini Critic Agent...", C_MAGENTA)
+                    critic_prompt = f"evaluate and find evidences from accross the codebase that shows this codebase is not yet production ready. find stubs, wiring breaks, unimplemented logic, unwired or unused logic and features, semantic and syntax bugs etc\n\nCodebase:\n{codebase}"
+                    critic_out = call_gemini_agent(critic_prompt)
+                    
+                    # Bypass Linux terminal input limits (4096 bytes) by writing the prompt natively to a file
+                    with open(instruction_path, "w", encoding="utf-8") as f:
+                        f.write(f"Resolve all this issues and update the documentations: {critic_out}")
+                        
+                    goal_text = "Read the file 'ovan_agent_instruction.txt' at the root of the project and meticulously execute the prompt contained within it."
 
-            # If we successfully finished all goals, we break out entirely.
-            if child.isalive():
-                child.sendline("/stop")
-                time.sleep(1)
-                child.close(force=True)
-            break
+                # --- PHASE 4: FINAL REVIEW AGENT ---
+                elif state_phase == 4:
+                    if state_index >= 3:
+                        state_phase = 5 # Complete!
+                        break
+                        
+                    prefix = f"Phase 4: Readiness Review (Attempt {state_index+1}/3)"
+                    log("\nCompiling codebase for Final Review Agent...", C_MAGENTA)
+                    codebase = consolidate_codebase(target_dir)
+                    
+                    log("Calling Gemini Final Review Agent...", C_MAGENTA)
+                    review_prompt = f"How production ready is this code? list all shortcomings if there are any.\nIf the codebase is 100% completely production ready with absolutely no shortcomings, start your response with the exact word: PRODUCTION_READY\n\nCodebase:\n{codebase}"
+                    review_out = call_gemini_agent(review_prompt)
+                    
+                    if review_out.strip().startswith("PRODUCTION_READY"):
+                        log("Final Review Agent deemed the codebase PRODUCTION READY! Validation complete.", C_GREEN)
+                        state_phase = 5
+                        break
+                        
+                    # Bypass Linux terminal limits
+                    with open(instruction_path, "w", encoding="utf-8") as f:
+                        f.write(f"Resolve all issues and update the documentations: {review_out}")
+                        
+                    goal_text = "Read the file 'ovan_agent_instruction.txt' at the root of the project and meticulously execute the prompt contained within it."
+
+                # --- Execute Chosen Goal ---
+                success = execute_procoder_goal(child, goal_text, prefix, idle_timeout, pause_seconds)
+                
+                if success:
+                    state_index += 1
+                    retry_count = 0
+                    if os.path.exists(instruction_path):
+                        try: os.remove(instruction_path)
+                        except: pass
+                else:
+                    break # Breaks the inner loop to respawn ProCoder
+
+            # SHUTDOWN IF FINISHED
+            if state_phase == 5:
+                if child.isalive():
+                    child.sendline("/stop")
+                    time.sleep(1)
+                    child.close(force=True)
+                break
 
         except pexpect.TIMEOUT as e:
             if phase_marker == "INIT":
-                log(f"System hung during startup. {idle_timeout} seconds (30 minutes) of absolute silence elapsed.", C_RED)
+                log(f"System hung during startup. {idle_timeout}s elapsed without output.", C_RED)
             else:
-                log(f"Agent froze. No terminal output detected for {idle_timeout} seconds (30 minutes) straight.", C_RED)
-            
+                log(f"Agent froze. No output detected for {idle_timeout}s straight.", C_RED)
+                
             retry_count += 1
             if retry_count > max_retries:
                 log("Maximum retries reached. Aborting pipeline.", C_RED)
-                if child.isalive():
-                    child.close(force=True)
+                if child.isalive(): child.close(force=True)
                 break
-            
-            log(f"Restarting ProCoder and resuming from Goal {current_goal_index+1}...", C_YELLOW)
-            if child.isalive():
-                child.close(force=True)
-            continue # Restart the outer while loop
+                
+            log(f"Restarting ProCoder and resuming from Phase {state_phase}, Goal/Attempt {state_index+1}...", C_YELLOW)
+            if child.isalive(): child.close(force=True)
+            continue 
 
         except pexpect.EOF:
             log("ProCoder process terminated unexpectedly.", C_RED)
             retry_count += 1
-            if retry_count > max_retries:
-                break
-            
-            log(f"Restarting ProCoder and resuming from Goal {current_goal_index+1}...", C_YELLOW)
-            if child.isalive():
-                child.close(force=True)
+            if retry_count > max_retries: break
+            log(f"Restarting ProCoder and resuming from Phase {state_phase}, Goal/Attempt {state_index+1}...", C_YELLOW)
+            if child.isalive(): child.close(force=True)
             continue
             
         except KeyboardInterrupt:
             log("Interrupted by user. Shutting down.", C_RED)
-            if child.isalive():
-                child.close(force=True)
+            if child.isalive(): child.close(force=True)
             break
 
-    log("Ovan Orchestration Complete. Your system is ready.", C_GREEN)
+    log("==========================================================", C_GREEN)
+    log(f"ORCHESTRATION COMPLETE! HANDING OVER FINAL CODEBASE", C_GREEN)
+    log(f"FULL PRODUCTION READY PATH: {target_dir}", C_CYAN)
+    log("==========================================================", C_GREEN)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ovan: ACN -> ProCoder Orchestrator")
+    parser = argparse.ArgumentParser(description="Ovan: Evolved ACN -> ProCoder Orchestrator")
     
-    # Make 'task' optional by using nargs='?' so we can supply --path instead
     parser.add_argument("task", type=str, nargs="?", default=None, 
-                        help="The initial high-level task for ACN (Optional if --path is provided).")
-    
+                        help="Initial task for ACN Genesis (Optional if --path provided).")
     parser.add_argument("--path", type=str, default=None, 
-                        help="Directly provide the workspace path to refine, skipping Phase 1 (ACN Genesis).")
-                        
+                        help="Directly provide workspace path, skipping Phase 1.")
     parser.add_argument("--procoder-cmd", type=str, default="python3 scripts/procoder_cli.py", 
-                        help="The CLI command used to launch ProCoder")
-    
-    # Force the timeout to default to 1800 (30 minutes)
+                        help="CLI command used to launch ProCoder")
     parser.add_argument("--idle-timeout", type=int, default=1800, 
                         help="Inactivity timeout in seconds (default: 1800s / 30m)")
-    
-    # Catch the old flag just in case your bash script uses it, but ignore it and force 1800
     parser.add_argument("--goal-timeout", type=int, default=1800, help=argparse.SUPPRESS)
-    
     parser.add_argument("--pause-seconds", type=int, default=30, 
                         help="Seconds to pause between goals (default: 30s)")
     
     args = parser.parse_args()
-    
-    # HARD OVERRIDE: Even if a legacy script passes --goal-timeout 600, force to args.idle_timeout.
     actual_timeout = 1800 if args.goal_timeout == 600 else args.idle_timeout
 
     detected_target = None
 
     if args.path:
-        # User provided a direct path, skip Phase 1
         detected_target = os.path.abspath(args.path)
         log(f"Skipping Phase 1 (ACN Genesis).", C_YELLOW)
         log(f"Using provided target path: {detected_target}", C_CYAN)
     elif args.task:
-        # Phase 1: Fire ACN Genesis and extract output path
         detected_target = run_phase1_acn(args.task)
         if not detected_target:
             log("Could not extract 'Codebase: <path>' from ACN output. Did it fail?", C_RED)
@@ -356,10 +445,8 @@ def main():
         parser.print_help()
         sys.exit(1)
     
-    # Check if the output is a single file or a directory
     if os.path.isfile(detected_target):
-        log(f"Target '{detected_target}' is a single file.", C_CYAN)
-        log("Skipping ProCoder refinement phase. Presenting work to user.", C_GREEN)
+        log(f"Target '{detected_target}' is a single file. Skipping ProCoder.", C_CYAN)
         sys.exit(0)
     elif not os.path.isdir(detected_target):
         log(f"Extracted/Provided path '{detected_target}' does not exist on the filesystem.", C_RED)
@@ -367,19 +454,8 @@ def main():
 
     time.sleep(2)
 
-    # Phase 2: Run ProCoder
-    run_phase2_procoder(detected_target, args.procoder_cmd, actual_timeout, args.pause_seconds)
-
+    # Boot Phases 2 through 4
+    run_phases_2_to_4(detected_target, args.procoder_cmd, actual_timeout, args.pause_seconds)
 
 if __name__ == "__main__":
     main()
-        log("Skipping ProCoder refinement phase. Presenting work to user.", C_GREEN)
-        sys.exit(0)
-    elif not os.path.isdir(detected_target):
-        log(f"Extracted/Provided path '{detected_target}' does not exist on the filesystem.", C_RED)
-        sys.exit(1)
-
-    time.sleep(2)
-
-    # Phase 2: Run ProCoder
-    run_phase2_procoder(detected_target, args.procoder_cmd, actual_timeout, args.pause_seconds)
